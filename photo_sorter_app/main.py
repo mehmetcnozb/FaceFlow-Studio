@@ -16,7 +16,8 @@ import time
 from pathlib import Path
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from queue import Queue
+from queue import Queue, Empty
+from file_safety import copy_unique
 
 import customtkinter as ctk
 from PIL import Image
@@ -292,7 +293,7 @@ class FaceRecognizer:
         try:
             img = cv2.imread(image_path)
             if img is None:
-                return False, 0.0
+                raise ValueError("Fotoğraf okunamadı.")
 
             faces = self.app.get(img)
             if not faces:
@@ -308,8 +309,8 @@ class FaceRecognizer:
 
             return False, 0.0
 
-        except Exception:
-            return False, 0.0
+        except Exception as exc:
+            raise RuntimeError(f"Fotoğraf analizi başarısız: {exc}") from exc
 
     def check_match_from_bytes(self, image_bytes: bytes, tolerance: float = 0.5) -> tuple[bool, float]:
         """Bellekteki görüntü verisini referansla karşılaştırır (disk I/O gerektirmez)."""
@@ -320,7 +321,7 @@ class FaceRecognizer:
             nparr = np.frombuffer(image_bytes, np.uint8)
             img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
             if img is None:
-                return False, 0.0
+                raise ValueError("Fotoğraf okunamadı.")
 
             faces = self.app.get(img)
             if not faces:
@@ -336,8 +337,8 @@ class FaceRecognizer:
 
             return False, 0.0
 
-        except Exception:
-            return False, 0.0
+        except Exception as exc:
+            raise RuntimeError(f"Fotoğraf analizi başarısız: {exc}") from exc
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -385,35 +386,60 @@ class PhotoSorterApp(ctk.CTk):
         self.stat_errors = 0
         self._start_time = None
 
+        self.ui_events = Queue()
         self._build_ui()
+        self.after(50, self._drain_ui_events)
         # Yüz tanıma motorunu arka planda başlat (arayüzün donmasını engeller)
         threading.Thread(target=self._init_face_recognizer, daemon=True).start()
 
     def _init_face_recognizer(self):
-        self._log("⏳ Yüz tanıma motoru hazırlanıyor (GPU algılanıyor)...")
+        self._log_safe("⏳ Yüz tanıma motoru hazırlanıyor (GPU algılanıyor)...")
         try:
-            self.face_recognizer = FaceRecognizer(log_callback=self._log_safe)
+            recognizer = FaceRecognizer(log_callback=self._log_safe)
         except Exception as e:
             self._log_safe(f"⚠️ GPU başlatılamadı, CPU moduna geçiliyor: {e}")
             try:
                 # GPU başarısız olursa CPU'ya düş
-                self.face_recognizer = FaceRecognizer.__new__(FaceRecognizer)
-                self.face_recognizer.reference_encoding = None
-                self.face_recognizer.reference_loaded = False
-                self.face_recognizer._log = self._log_safe
-                self.face_recognizer.app = FaceAnalysis(
+                recognizer = FaceRecognizer.__new__(FaceRecognizer)
+                recognizer.reference_encoding = None
+                recognizer.reference_loaded = False
+                recognizer._log = self._log_safe
+                recognizer.app = FaceAnalysis(
                     name='buffalo_l',
                     providers=['CPUExecutionProvider']
                 )
-                self.face_recognizer.app.prepare(ctx_id=-1, det_size=(640, 640))
-                self.face_recognizer.active_provider = 'CPUExecutionProvider'
+                recognizer.app.prepare(ctx_id=-1, det_size=(640, 640))
+                recognizer.active_provider = 'CPUExecutionProvider'
                 self._log_safe("✅ Yüz tanıma motoru hazır (CPU modu)")
             except Exception as e2:
+                recognizer = None
                 self._log_safe(f"❌ Motor başlatılamadı: {e2}")
+                self._post_ui(lambda msg=str(e2): messagebox.showerror("Motor yüklenemedi", msg))
+
+        if recognizer is not None:
+            def ready():
+                self.face_recognizer = recognizer
+                self._log("✅ Yüz tanıma motoru hazır.")
+            self._post_ui(ready)
+
+    def _post_ui(self, callback):
+        self.ui_events.put(callback)
+
+    def _drain_ui_events(self):
+        for _ in range(100):
+            try:
+                callback = self.ui_events.get_nowait()
+            except Empty:
+                break
+            try:
+                callback()
+            except Exception:
+                self.report_callback_exception(*sys.exc_info())
+        self.after(50, self._drain_ui_events)
 
     def _log_safe(self, message: str):
         """Thread-safe log fonksiyonu (herhangi bir thread'den çağrılabilir)."""
-        self.after(0, lambda: self._log(message))
+        self._post_ui(lambda: self._log(message))
 
     def _build_ui(self):
         self.grid_columnconfigure(0, weight=1)
@@ -732,6 +758,8 @@ class PhotoSorterApp(ctk.CTk):
             self.btn_tab_drive.configure(fg_color=self.C_BORDER)
 
     def _select_reference(self):
+        if self.is_processing:
+            return
         if not self.face_recognizer:
             messagebox.showwarning("Bekleyin", "Yüz tanıma motoru arka planda yükleniyor, lütfen birkaç saniye bekleyip tekrar deneyin.")
             return
@@ -764,6 +792,8 @@ class PhotoSorterApp(ctk.CTk):
             self.local_folder_var.set(path)
 
     def _select_output_folder(self):
+        if self.is_processing:
+            return
         path = filedialog.askdirectory()
         if path:
             self.output_dir = path
@@ -773,6 +803,8 @@ class PhotoSorterApp(ctk.CTk):
     # ─── Google Drive Kimlik Doğrulama ────────────────────────────────────────
 
     def _authenticate_drive_thread(self):
+        if self.is_processing:
+            return
         self.btn_auth.configure(state="disabled", text="⏳ Bekleniyor...")
         self.drive_status.configure(text="Tarayıcıda giriş bekleniyor...", text_color="#ffab00")
         threading.Thread(target=self._authenticate_drive, daemon=True).start()
@@ -780,27 +812,29 @@ class PhotoSorterApp(ctk.CTk):
     def _authenticate_drive(self):
         try:
             self.drive_manager.authenticate()
-            self.after(0, lambda: self.btn_auth.configure(state="normal", text="✅ Bağlı", fg_color="#0d7a3e"))
-            self.after(0, lambda: self.drive_status.configure(
+            self._post_ui(lambda: self.btn_auth.configure(state="normal", text="✅ Bağlı", fg_color="#0d7a3e"))
+            self._post_ui(lambda: self.drive_status.configure(
                 text="✅ Google Drive bağlantısı başarılı!", text_color=self.C_SUCCESS
             ))
-            self.after(0, lambda: self._log("✅ Google Drive'a başarıyla bağlanıldı!"))
+            self._post_ui(lambda: self._log("✅ Google Drive'a başarıyla bağlanıldı!"))
         except FileNotFoundError as e:
-            self.after(0, lambda: messagebox.showerror("credentials.json Bulunamadı", str(e)))
-            self.after(0, lambda: self.btn_auth.configure(state="normal", text="🔑 Giriş Yap"))
-            self.after(0, lambda: self.drive_status.configure(
+            self._post_ui(lambda msg=str(e): messagebox.showerror("credentials.json Bulunamadı", msg))
+            self._post_ui(lambda: self.btn_auth.configure(state="normal", text="🔑 Giriş Yap"))
+            self._post_ui(lambda: self.drive_status.configure(
                 text="❌ credentials.json bulunamadı!", text_color=self.C_ACCENT
             ))
         except Exception as e:
-            self.after(0, lambda: messagebox.showerror("Bağlantı Hatası", str(e)))
-            self.after(0, lambda: self.btn_auth.configure(state="normal", text="🔑 Giriş Yap"))
-            self.after(0, lambda: self.drive_status.configure(
-                text=f"❌ Hata: {str(e)[:60]}", text_color=self.C_ACCENT
+            self._post_ui(lambda msg=str(e): messagebox.showerror("Bağlantı Hatası", msg))
+            self._post_ui(lambda: self.btn_auth.configure(state="normal", text="🔑 Giriş Yap"))
+            self._post_ui(lambda msg=str(e): self.drive_status.configure(
+                text=f"❌ Hata: {msg[:60]}", text_color=self.C_ACCENT
             ))
 
     # ─── İşlem Başlatma / Durdurma ────────────────────────────────────────────
 
     def _start_processing(self):
+        if self.is_processing:
+            return
         if not self.reference_path or not self.face_recognizer or not self.face_recognizer.reference_loaded:
             messagebox.showwarning("Uyarı", "Lütfen önce bir referans fotoğraf seçin!")
             return
@@ -822,11 +856,19 @@ class PhotoSorterApp(ctk.CTk):
                 return
         else:
             local_path = self.local_folder_var.get().strip()
-            if not local_path or not Path(local_path).exists():
+            if not local_path or not Path(local_path).is_dir():
                 messagebox.showwarning("Uyarı", "Lütfen geçerli bir yerel klasör seçin!")
                 return
 
-        self.output_dir = self.entry_output.get().strip()
+        self.output_dir = str(Path(self.entry_output.get().strip()).resolve())
+        if self.source_mode == "local" and Path(local_path).resolve() == Path(self.output_dir):
+            messagebox.showwarning("Uyarı", "Kaynak ve çıktı klasörü farklı olmalıdır.")
+            return
+        self.run_mode = self.source_mode
+        self.run_tolerance = self.tolerance_var.get()
+        self.run_recursive = self.recursive_var.get()
+        self.run_source = self.local_folder_var.get().strip()
+        self.run_folder_id = folder_id if self.source_mode == "drive" else None
         self.is_processing = True
         self.cancel_requested = False
         self.stat_scanned = self.stat_matched = self.stat_errors = 0
@@ -841,167 +883,96 @@ class PhotoSorterApp(ctk.CTk):
         self.cancel_requested = True
         self._log("⏹️ İptal istendi, mevcut işlem tamamlanınca durulacak...")
 
-    def _finish_processing(self):
-        """İşlem tamamlandığında UI'ı güncelle."""
-        elapsed = time.time() - self._start_time if self._start_time else 0
-        mins, secs = divmod(int(elapsed), 60)
-        self.after(0, lambda: self.btn_start.configure(state="normal"))
-        self.after(0, lambda: self.btn_stop.configure(state="disabled"))
-        self.after(0, lambda: self.progress_bar.set(1.0))
-        self.after(0, lambda: self._update_stats())
-        self.after(0, lambda: self._log(
-            f"🏁 İşlem bitti! — Taranan: {self.stat_scanned} | Eşleşen: {self.stat_matched} | "
-            f"Hata: {self.stat_errors} | Süre: {mins}dk {secs}sn"
-        ))
-        if self.cancel_requested:
-            self.after(0, lambda: self._log("⚠️ İşlem kullanıcı tarafından durduruldu."))
+    def _finish_processing(self, failed=False):
+        # Called only by the UI event queue, after all progress events.
+        self.is_processing = False
+        self.btn_start.configure(state="normal")
+        self.btn_stop.configure(state="disabled")
+        status = "Başarısız" if failed else ("Durduruldu" if self.cancel_requested else ("Hatalarla tamamlandı" if self.stat_errors else "Tamamlandı"))
+        if not failed and not self.cancel_requested:
+            self.progress_bar.set(1.0)
+        self.progress_label.configure(text=status)
+        self._update_stats()
+        self._log(f"{status} — Taranan: {self.stat_scanned} | Eşleşen: {self.stat_matched} | Hata: {self.stat_errors}")
 
     def _process_photos(self):
+        failed = False
         try:
             os.makedirs(self.output_dir, exist_ok=True)
-            tolerance = self.tolerance_var.get()
-            if self.source_mode == "drive":
-                self._process_from_drive(tolerance)
+            if self.run_mode == "drive":
+                self._process_from_drive(self.run_tolerance)
             else:
-                self._process_from_local(tolerance)
-        except Exception as e:
-            self.after(0, lambda: self._log(f"❌ Beklenmeyen hata: {e}"))
+                self._process_from_local(self.run_tolerance)
+        except Exception as exc:
+            failed = True
+            self.stat_errors += 1
+            self._log_safe(f"❌ İşlem hatası: {exc}")
         finally:
-            self._finish_processing()
+            self._post_ui(lambda error=failed: self._finish_processing(error))
 
-    # ─── Google Drive'dan İşleme (Paralel İndirme + GPU Tarama) ──────────────
+    def _save_match(self, source, name, tolerance):
+        matched, confidence = self.face_recognizer.check_match(str(source), tolerance)
+        if matched:
+            saved = copy_unique(source, self.output_dir, name)
+            self.stat_matched += 1
+            self._log_safe(f"✅ EŞLEŞTİ (%{confidence}): {saved.name}")
 
-    def _process_from_drive(self, tolerance: float):
-        url = self.drive_url_var.get().strip()
-        folder_id = GoogleDriveManager.extract_folder_id(url)
-        if not folder_id:
-            self.after(0, lambda: self._log("❌ Geçersiz Drive linki!"))
-            return
+    def _record_error(self, name, exc):
+        self.stat_errors += 1
+        self._log_safe(f"❌ {name}: {exc}")
 
-        self.after(0, lambda: self._log("📡 Drive klasörü taranıyor..."))
-        self.after(0, lambda: self.progress_label.configure(text="Drive klasörü listeleniyor..."))
+    def _progress(self, index, total):
+        self._post_ui(self._update_stats)
+        self._post_ui(lambda p=index/total: self.progress_bar.set(p))
 
-        try:
-            recursive = self.recursive_var.get()
-            images = self.drive_manager.list_images_in_folder(folder_id, recursive=recursive)
-        except Exception as e:
-            self.after(0, lambda: self._log(f"❌ Drive klasörü okunamadı: {e}"))
-            self.after(0, lambda: messagebox.showerror("Drive Hatası", str(e)))
-            return
-
-        total = len(images)
-        if total == 0:
-            self.after(0, lambda: self._log("⚠️ Klasörde fotoğraf bulunamadı!"))
-            return
-
-        self.after(0, lambda: self._log(f"📊 Toplam {total} fotoğraf bulundu, indirme ve tarama başlıyor..."))
-
-        temp_dir = Path(self.output_dir) / "__temp_downloads__"
-        temp_dir.mkdir(parents=True, exist_ok=True)
-
-        try:
-            for i, file_info in enumerate(images):
+    def _process_from_drive(self, tolerance):
+        self._log_safe("📡 Drive klasörü listeleniyor...")
+        images = self.drive_manager.list_images_in_folder(self.run_folder_id, recursive=self.run_recursive)
+        if not images:
+            self._log_safe("Klasörde fotoğraf bulunamadı.")
+        # Unique per-run directory: never remove an existing user folder.
+        with tempfile.TemporaryDirectory(prefix="photo_sorter_", dir=self.output_dir) as temporary:
+            for i, info in enumerate(images):
                 if self.cancel_requested:
                     break
-
-                name = file_info['name']
-                file_id = file_info['id']
-
-                self.after(0, lambda n=name, idx=i, t=total: (
-                    self.progress_label.configure(text=f"[{idx+1}/{t}] İndiriliyor: {n}"),
-                    self.progress_bar.set((idx + 0.5) / t)
-                ))
-
+                name = info['name']
+                source = Path(temporary) / 'download.image'
+                self._post_ui(lambda n=name: self.progress_label.configure(text=f"İndiriliyor ve taranıyor: {n}"))
                 try:
-                    # Dosyayı belleğe indir
-                    image_bytes = self.drive_manager.download_file_to_memory(file_id)
+                    self.drive_manager.download_file(info['id'], str(source))
+                    if self.cancel_requested:
+                        break
+                    self._save_match(source, name, tolerance)
+                except Exception as exc:
+                    self._record_error(name, exc)
+                finally:
+                    source.unlink(missing_ok=True)
+                self.stat_scanned += 1
+                self._progress(i+1, len(images))
 
-                    # GPU ile yüz tanıma (bellekten)
-                    matched, conf = self.face_recognizer.check_match_from_bytes(image_bytes, tolerance)
-                    self.stat_scanned += 1
-
-                    if matched:
-                        self.stat_matched += 1
-                        # Eşleşen fotoğrafı kaydet
-                        output_path = Path(self.output_dir) / name
-                        # Aynı isimde dosya varsa numara ekle
-                        counter = 1
-                        while output_path.exists():
-                            stem = Path(name).stem
-                            suffix = Path(name).suffix
-                            output_path = Path(self.output_dir) / f"{stem}_{counter}{suffix}"
-                            counter += 1
-                        with open(output_path, 'wb') as f:
-                            f.write(image_bytes)
-                        self.after(0, lambda n=name, c=conf: self._log(f"✅ EŞLEŞTİ (%{c}): {n}"))
-
-                except Exception as e:
-                    self.stat_errors += 1
-                    self.after(0, lambda n=name, err=str(e): self._log(f"⚠️ Hata ({n}): {err}"))
-
-                self.after(0, self._update_stats)
-                self.after(0, lambda p=(i + 1) / total: self.progress_bar.set(p))
-
-        finally:
-            shutil.rmtree(temp_dir, ignore_errors=True)
-
-    # ─── Yerel Klasörden İşleme (GPU Tarama) ─────────────────────────────────
-
-    def _process_from_local(self, tolerance: float):
-        source_dir = Path(self.local_folder_var.get().strip())
-
-        if not source_dir.exists():
-            self.after(0, lambda: self._log("❌ Kaynak klasör bulunamadı!"))
-            return
-
-        # Recursive veya tek klasör tarama
-        if self.recursive_var.get():
-            image_files = []
-            for root, dirs, files in os.walk(source_dir):
-                for f in files:
-                    if Path(f).suffix.lower() in IMAGE_EXTENSIONS:
-                        image_files.append(Path(root) / f)
-            self.after(0, lambda: self._log(f"📁 Alt klasörler dahil recursive tarama yapılıyor..."))
+    def _process_from_local(self, tolerance):
+        source = Path(self.run_source)
+        output = Path(self.output_dir).resolve()
+        if self.run_recursive:
+            images = []
+            for root, dirs, files in os.walk(source):
+                # Do not rescan an output directory nested in the source tree.
+                dirs[:] = [d for d in dirs if (Path(root)/d).resolve() != output]
+                images.extend(Path(root)/f for f in files if Path(f).suffix.lower() in IMAGE_EXTENSIONS)
         else:
-            image_files = [f for f in source_dir.iterdir() if f.suffix.lower() in IMAGE_EXTENSIONS]
-
-        total = len(image_files)
-        if total == 0:
-            self.after(0, lambda: self._log("⚠️ Klasörde fotoğraf bulunamadı!"))
-            return
-
-        self.after(0, lambda: self._log(f"📊 Toplam {total} fotoğraf bulundu, GPU ile taranıyor..."))
-
-        for i, img_path in enumerate(image_files):
+            images = [p for p in source.iterdir() if p.is_file() and p.suffix.lower() in IMAGE_EXTENSIONS]
+        if not images:
+            self._log_safe("Klasörde fotoğraf bulunamadı.")
+        for i, path in enumerate(images):
             if self.cancel_requested:
                 break
-
-            self.after(0, lambda n=img_path.name, idx=i, t=total: (
-                self.progress_label.configure(text=f"[{idx+1}/{t}] Taranıyor: {n}"),
-                self.progress_bar.set((idx + 0.5) / t)
-            ))
-
+            self._post_ui(lambda n=path.name: self.progress_label.configure(text=f"Taranıyor: {n}"))
             try:
-                self.stat_scanned += 1
-                matched, conf = self.face_recognizer.check_match(str(img_path), tolerance)
-                if matched:
-                    self.stat_matched += 1
-                    dest_name = img_path.name
-                    output_path = Path(self.output_dir) / dest_name
-                    counter = 1
-                    while output_path.exists():
-                        stem = img_path.stem
-                        suffix = img_path.suffix
-                        output_path = Path(self.output_dir) / f"{stem}_{counter}{suffix}"
-                        counter += 1
-                    shutil.copy2(str(img_path), str(output_path))
-                    self.after(0, lambda n=img_path.name, c=conf: self._log(f"✅ EŞLEŞTİ (%{c}): {n}"))
-            except Exception as e:
-                self.stat_errors += 1
-                self.after(0, lambda n=img_path.name, err=str(e): self._log(f"⚠️ Hata ({n}): {err}"))
-
-            self.after(0, self._update_stats)
-            self.after(0, lambda p=(i + 1) / total: self.progress_bar.set(p))
+                self._save_match(path, path.name, tolerance)
+            except Exception as exc:
+                self._record_error(path.name, exc)
+            self.stat_scanned += 1
+            self._progress(i+1, len(images))
 
 
 if __name__ == "__main__":
